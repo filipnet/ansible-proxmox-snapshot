@@ -1,0 +1,157 @@
+---
+- name: Ensure Proxmox host and API token are defined
+  assert:
+    that:
+      - proxmox_snapshot_host != ""
+      - proxmox_snapshot_api_token != ""
+    fail_msg: "Proxmox host or API token not defined"
+
+- name: Show Proxmox API URL and curl command
+  debug:
+    msg:
+      - "API URL: https://{{ proxmox_snapshot_host }}:8006/api2/json/nodes"
+      - "Authorization header: PVEAPIToken={{ proxmox_snapshot_api_token }}"
+      - "Full curl command: curl -k -s -H 'Authorization: PVEAPIToken={{ proxmox_snapshot_api_token }}' https://{{ proxmox_snapshot_host }}:8006/api2/json/nodes"
+
+# --- Test connection ---
+- name: Test Proxmox API connection
+  ansible.builtin.uri:
+    url: "https://{{ proxmox_snapshot_host }}:8006/api2/json/nodes"
+    method: GET
+    headers:
+      Authorization: 'PVEAPIToken={{ proxmox_snapshot_api_token }}'
+    validate_certs: no
+    timeout: "{{ proxmox_snapshot_api_timeout }}"
+  delegate_to: localhost
+  run_once: true
+  register: uri_connection_test
+
+- name: Show Proxmox API response
+  debug:
+    var: uri_connection_test.json
+
+# --- Gather all cluster nodes ---
+- name: Get all nodes in the cluster
+  ansible.builtin.uri:
+    url: "https://{{ proxmox_snapshot_host }}:8006/api2/json/nodes"
+    method: GET
+    headers:
+      Authorization: 'PVEAPIToken={{ proxmox_snapshot_api_token }}'
+    validate_certs: no
+    timeout: "{{ proxmox_snapshot_api_timeout }}"
+  delegate_to: localhost
+  run_once: true
+  register: cluster_nodes
+
+- name: Get only online cluster nodes
+  set_fact:
+    online_nodes: "{{ cluster_nodes.json.data | selectattr('status','equalto','online') | list }}"
+
+# --- Gather all VMs and LXCs per online node ---
+- name: Gather QEMU VMs per online node
+  ansible.builtin.uri:
+    url: "https://{{ proxmox_snapshot_host }}:8006/api2/json/nodes/{{ item.node }}/qemu"
+    method: GET
+    headers:
+      Authorization: 'PVEAPIToken={{ proxmox_snapshot_api_token }}'
+    validate_certs: no
+    timeout: "{{ proxmox_snapshot_api_timeout }}"
+  loop: "{{ online_nodes }}"
+  loop_control:
+    loop_var: item
+  delegate_to: localhost
+  register: qemu_results
+
+- name: Gather LXC containers per online node
+  ansible.builtin.uri:
+    url: "https://{{ proxmox_snapshot_host }}:8006/api2/json/nodes/{{ item.node }}/lxc"
+    method: GET
+    headers:
+      Authorization: 'PVEAPIToken={{ proxmox_snapshot_api_token }}'
+    validate_certs: no
+    timeout: "{{ proxmox_snapshot_api_timeout }}"
+  loop: "{{ online_nodes }}"
+  loop_control:
+    loop_var: item
+  delegate_to: localhost
+  register: lxc_results
+
+# --- Combine all VMs and containers ---
+- name: Combine all VMs and LXCs
+  set_fact:
+    all_nodes: >-
+      {{ 
+        (qemu_results.results | map(attribute='json.data') | flatten | map('combine', {'type':'qemu'}) | list) +
+        (lxc_results.results | map(attribute='json.data') | flatten | map('combine', {'type':'lxc'}) | list)
+      }}
+
+# --- Determine target container matching inventory_hostname ---
+- name: Set short hostname
+  set_fact:
+    short_hostname: "{{ inventory_hostname.split('.')[0] }}"
+
+- name: Find target container or VM
+  set_fact:
+    proxmox_snapshot_target: >-
+      {{ all_nodes | selectattr('name', 'equalto', short_hostname) | first | default({}) }}
+
+- name: Fail if no matching container found
+  fail:
+    msg: "No VM or LXC container found with name {{ inventory_hostname }} in the cluster"
+  when: proxmox_snapshot_target == {}
+
+- name: Debug selected target container
+  debug:
+    msg: "Selected container for snapshot: {{ proxmox_snapshot_target }}"
+
+# --- Ensure target container has node and vmid ---
+- name: Add node info to target container if missing
+  set_fact:
+    proxmox_snapshot_target: >-
+      {{
+        proxmox_snapshot_target | combine({
+          'node': (
+            (qemu_results.results | map(attribute='json.data') | flatten
+             | selectattr('name','equalto', short_hostname)
+             | map(attribute='node') | first | default(proxmox_snapshot_host.split('.')[0]))
+            if proxmox_snapshot_target.type == 'qemu'
+            else
+            (lxc_results.results | map(attribute='json.data') | flatten
+             | selectattr('name','equalto', short_hostname)
+             | map(attribute='node') | first | default(proxmox_snapshot_host.split('.')[0]))
+          )
+        })
+      }}
+
+# --- Debug snapshot request ---
+- name: Show complete snapshot request info
+  debug:
+    msg:
+      url: "https://{{ proxmox_snapshot_host }}:8006/api2/json/nodes/{{ proxmox_snapshot_target.node }}/{{ proxmox_snapshot_target.type }}/{{ proxmox_snapshot_target.vmid }}/snapshot"
+      node: "{{ proxmox_snapshot_target.node }}"
+      type: "{{ proxmox_snapshot_target.type }}"
+      vmid: "{{ proxmox_snapshot_target.vmid }}"
+      host_variable: "{{ proxmox_snapshot_host }}"
+      body:
+        snapname: "{{ proxmox_snapshot_name_prefix }}-{{ lookup('ansible.builtin.pipe', 'date +%Y-%m-%d_%H-%M') }}"
+
+# --- Create snapshot ---
+- name: Create pre-update snapshot for target container
+  uri:
+    url: >-
+      https://{{ proxmox_snapshot_host }}:8006/api2/json/nodes/{{ proxmox_snapshot_target.node }}/{{ proxmox_snapshot_target.type }}/{{ proxmox_snapshot_target.vmid }}/snapshot
+    method: POST
+    headers:
+      Authorization: "PVEAPIToken={{ proxmox_snapshot_api_token }}"
+    body_format: json
+    body:
+      snapname: "{{ proxmox_snapshot_name_prefix }}-{{ lookup('ansible.builtin.pipe', 'date +%Y-%m-%d_%H-%M') }}"
+      description: "{{ proxmox_snapshot_description }}"
+    validate_certs: no
+  register: snapshot_result
+  delegate_to: localhost
+
+- name: Fail if snapshot creation failed
+  fail:
+    msg: "Snapshot creation failed: {{ snapshot_result.json }}"
+  when: snapshot_result.status != 200

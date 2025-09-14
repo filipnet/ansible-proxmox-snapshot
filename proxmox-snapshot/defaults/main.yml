@@ -1,0 +1,11 @@
+---
+# Proxmox host and API token must be set per host or in group_vars
+proxmox_snapshot_host: "pvenode.examplecorp.io"
+proxmox_snapshot_api_token: "ansible@pve!token-ansible=12345678-ABCD-1234-ABCD-1234567890AB" # Format: user@realm!tokenid=secret
+
+# Snapshot naming and description
+proxmox_snapshot_name_prefix: "pre-update"
+proxmox_snapshot_description: "Created by Ansible"
+
+# Optional: timeout for Proxmox API requests
+proxmox_snapshot_api_timeout: 60
